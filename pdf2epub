@@ -1,0 +1,529 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.12,<3.14"
+# dependencies = [
+#   "docling>=2.148",
+#   "ocrmac>=1.0; sys_platform == 'darwin'",
+# ]
+# ///
+"""pdf2epub - convert PDF books and documents to EPUB (Docling + pandoc).
+
+Routing is automatic and per page:
+  * pages with a real text layer      -> text is read directly (fast, exact)
+  * scanned pages / pictures of text  -> OCR (Apple Vision on macOS)
+  * pages with a broken text layer    -> re-read with full-page OCR
+Docling then rebuilds reading order, chapters/sections, tables and figures,
+drops running headers/footers/page numbers, and pandoc packages it as EPUB 3
+with a table of contents and a cover made from the first page.
+
+Examples:
+  pdf2epub book.pdf
+  pdf2epub *.pdf -o ~/Books
+  pdf2epub scan.pdf --lang es --force-ocr
+  pdf2epub book.pdf --pages 1-20 --keep      # quick test, keep the markdown
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import warnings
+from pathlib import Path
+
+TEXT_PAGE_MIN_CHARS = 25  # fewer visible chars than this -> page treated as scanned
+COVER_HEIGHT_PX = 1600
+
+
+def log(msg: str = "", end: str = "\n") -> None:
+    print(msg, end=end, file=sys.stderr, flush=True)
+
+
+def plural(n: int, word: str) -> str:
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
+
+
+class Parser(argparse.ArgumentParser):
+    """On any usage mistake: show the full help, then the error last (where the
+    eye lands), with a 'did you mean' for mistyped options."""
+
+    def error(self, message: str):
+        self.print_help(sys.stderr)
+        hints = []
+        m = re.search(r"unrecognized arguments: (.*)", message)
+        if m:
+            for tok in m.group(1).split():
+                if tok.startswith("-"):
+                    close = difflib.get_close_matches(tok.split("=")[0], list(self._option_string_actions), n=1)
+                    if close:
+                        hints.append(f"did you mean {close[0]} instead of {tok}?")
+        log(f"\npdf2epub: error: {message}")
+        for h in hints:
+            log(f"  {h}")
+        sys.exit(2)
+
+
+def pages_arg(spec: str) -> tuple[int, int]:
+    m = re.fullmatch(r"\s*(\d+)\s*(?:(-)\s*(\d*)\s*)?", spec)
+    if not m:
+        raise argparse.ArgumentTypeError(f"{spec!r} is not a page range (use e.g. 5, 1-50 or 10-)")
+    start = int(m.group(1))
+    end = int(m.group(3)) if m.group(3) else (sys.maxsize if m.group(2) else start)
+    if start < 1 or end < start:
+        raise argparse.ArgumentTypeError(f"{spec!r} is not a valid page range (pages start at 1)")
+    return (start, end)
+
+
+def int_arg(lo: int, hi: int):
+    def check(value: str) -> int:
+        try:
+            n = int(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{value!r} is not a number")
+        if not lo <= n <= hi:
+            raise argparse.ArgumentTypeError(f"{n} is out of range ({lo}-{hi})")
+        return n
+    return check
+
+
+def lang_arg(value: str) -> list[str]:
+    codes = [c.strip() for c in value.split(",") if c.strip()]
+    bad = [c for c in codes if not re.fullmatch(r"[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*", c)]
+    if not codes or bad:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} doesn't look like language codes (use e.g. es, en, es-ES, or es,en)")
+    return codes
+
+
+def parse_args() -> argparse.Namespace:
+    p = Parser(
+        prog="pdf2epub",
+        description=__doc__.split("\n\n", 1)[0],
+        epilog=__doc__.split("\n\n", 1)[1],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("pdfs", nargs="+", type=Path, help="PDF file(s) to convert")
+    p.add_argument("-o", "--output", type=Path,
+                   help="output .epub file, or a directory (default: next to each PDF)")
+    p.add_argument("--title", help="book title (default: PDF metadata, then detected title)")
+    p.add_argument("--author", help="author (default: PDF metadata)")
+    p.add_argument("--lang", type=lang_arg, help="language(s), comma-separated, most likely first, "
+                   "e.g. 'es' or 'en,es'. Guides OCR and sets the EPUB language")
+    p.add_argument("--force-ocr", action="store_true",
+                   help="OCR every page and ignore the PDF text layer "
+                        "(use when an old scan has a bad embedded OCR layer)")
+    p.add_argument("--no-ocr", action="store_true",
+                   help="never OCR; text layer only (fastest, for born-digital PDFs)")
+    p.add_argument("--pages", type=pages_arg, default=(1, sys.maxsize), metavar="RANGE",
+                   help="page range: 5, 1-50 or 10- (default: all)")
+    p.add_argument("--chapter-level", type=int_arg(1, 6), default=1, metavar="N",
+                   help="split the EPUB into files at heading level N, 1-6 (default: 1)")
+    p.add_argument("--cover-page", type=int_arg(1, 100_000), metavar="N",
+                   help="page to use as the cover (default: first page)")
+    p.add_argument("--no-cover", action="store_true", help="don't add a cover image")
+    p.add_argument("--keep", action="store_true",
+                   help="keep the intermediate markdown + images in <name>.pdf2epub/")
+    p.add_argument("--overwrite", action="store_true", help="replace an existing .epub")
+    if len(sys.argv) == 1:
+        p.print_help(sys.stderr)
+        sys.exit(2)
+    a = p.parse_args()
+    if a.force_ocr and a.no_ocr:
+        p.error("--force-ocr and --no-ocr are mutually exclusive")
+    if a.output:
+        a.output = a.output.expanduser().resolve()
+        if len(a.pdfs) > 1 and a.output.suffix.lower() == ".epub":
+            p.error("with several PDFs, --output must be a directory, not an .epub file")
+        if a.output.is_file() and a.output.suffix.lower() != ".epub":
+            p.error(f"--output {a.output} is an existing file; give an .epub path or a directory")
+    return a
+
+
+def check_pdf(path: Path) -> str | None:
+    """Why this path can't be converted, or None if it looks like a PDF."""
+    if not path.exists():
+        return "no such file"
+    if path.is_dir():
+        return "is a folder (to convert everything in it: pdf2epub folder/*.pdf)"
+    try:
+        with path.open("rb") as f:
+            head = f.read(1024)
+    except OSError as e:
+        return f"can't read it ({e.strerror})"
+    if b"%PDF" not in head:
+        return "is not a PDF"
+    return None
+
+
+def output_path(pdf: Path, out: Path | None) -> Path:
+    if out is None:
+        return pdf.with_suffix(".epub")
+    if out.suffix.lower() == ".epub":
+        return out
+    return out / (pdf.stem + ".epub")
+
+
+def clean_meta(value: str | None) -> str | None:
+    """PDF metadata is often junk ('Microsoft Word - x.docx', 'untitled')."""
+    if not value:
+        return None
+    v = value.replace("\x00", "").strip()
+    if not v or v.lower() in {"untitled", "unknown", "anonymous", "title", "author", "user"}:
+        return None
+    if re.search(r"\.(pdf|docx?|odt|rtf|tex|dvi|e?ps|indd|qxd|pages)\s*$", v, re.I):
+        return None
+    if v.lower().startswith(("microsoft word", "microsoft powerpoint")):
+        return None
+    return v
+
+
+def pretty_stem(pdf: Path) -> str:
+    return re.sub(r"\s+", " ", pdf.stem.replace("_", " ")).strip()
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"[\W_]+", " ", s).strip().lower()
+
+
+NOT_A_TITLE = {"abstract", "contents", "table of contents", "preface", "foreword", "introduction",
+               "acknowledgements", "acknowledgments", "copyright", "about the author", "also by"}
+
+
+def guess_title(doc, first_page: int) -> str | None:
+    """A Docling 'title' near the start, else the first real heading on the first page."""
+    from docling_core.types.doc import DocItemLabel
+
+    headers = []
+    for item, _ in doc.iterate_items():
+        prov = getattr(item, "prov", None)
+        page = prov[0].page_no if prov else None
+        if page is None or page > first_page + 2:
+            continue
+        label = getattr(item, "label", None)
+        text = (getattr(item, "text", "") or "").strip()
+        if label == DocItemLabel.TITLE and text:
+            return text
+        if label == DocItemLabel.SECTION_HEADER and page == first_page:
+            headers.append(text)
+    for text in headers:
+        if 2 <= len(text.split()) <= 20 and _norm(text) not in NOT_A_TITLE:
+            return text
+    return None
+
+
+BOOK_PARTS = re.compile(
+    r"^(abstract|preface|foreword|introduction|prologue?|acknowledge?ments|contents|table of contents"
+    r"|dedication|epilogue|afterword|conclusions?|appendix( \w+)?|bibliography|references|index|notes"
+    r"|glossary|about the authors?"
+    r"|prólogo|prologo|prefacio|introducción|introduccion|índice|indice|contenidos?|epílogo|epilogo"
+    r"|apéndice( \w+)?|apendice( \w+)?|anexo( \w+)?|bibliografía|bibliografia|referencias|notas"
+    r"|glosario|agradecimientos|dedicatoria|conclusión|conclusion|conclusiones|sobre el autor|acerca del autor)$"
+)
+HEADING = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
+FENCE = re.compile(r"^\s*(```|~~~)")
+
+
+def chapter_level(heads: list, n_lines: int) -> int:
+    """The shallowest heading level that recurs through the whole book.
+    Big type on a title page or a stray mislabelled footnote can claim the top
+    levels without being chapters; real chapters repeat and are spread out."""
+    by_level: dict[int, list[int]] = {}
+    for i, level, _ in heads:
+        by_level.setdefault(level, []).append(i)
+    for level in sorted(by_level):
+        pos = by_level[level]
+        if len(pos) >= 3 and (max(pos) - min(pos)) >= 0.25 * n_lines:
+            return level
+    return min(by_level)
+
+
+def normalize_headings(md: str, title: str) -> str:
+    """Docling writes its 'title' as '#' and top-level sections as '##'.
+    Drop the body copy of the book title (pandoc makes a title page), find the
+    level that holds the chapters, lift anything above it to that level, and
+    shift so chapters are '#', which pandoc splits into files and puts at the
+    top of the table of contents."""
+    lines = md.split("\n")
+    heads, in_code = [], False
+    for i, line in enumerate(lines):
+        if FENCE.match(line):
+            in_code = not in_code
+            continue
+        m = None if in_code else HEADING.match(line)
+        if m:
+            heads.append([i, len(m.group(1)), m.group(2)])
+    # In Docling markdown '#' only ever means its 'title' label. A book has one
+    # title, before any other heading; later ones are misread footnotes or
+    # captions, so turn them back into plain text.
+    for n, h in enumerate(list(heads)):
+        if h[1] == 1 and n > 0:
+            lines[h[0]] = h[2]
+            heads.remove(h)
+    if heads and _norm(heads[0][2]) == _norm(title):
+        lines[heads[0][0]] = ""
+        heads = heads[1:]
+    if not heads:
+        return "\n".join(lines)
+    top = chapter_level(heads, len(lines))
+    # Preface, introduction, appendix... are often set smaller than chapter
+    # titles; they are chapters all the same.
+    for h in heads:
+        if h[1] > top and BOOK_PARTS.match(_norm(h[2])):
+            h[1] = top
+    for i, level, text in heads:
+        lines[i] = "#" * (max(level, top) - top + 1) + " " + text
+    return "\n".join(lines)
+
+
+def inspect_pdf(pdf: Path, rng: tuple[int, int], cover_to: Path | None, cover_page: int | None):
+    """Read metadata, count pages with/without a text layer, render the cover."""
+    import pypdfium2 as pdfium
+
+    doc = pdfium.PdfDocument(pdf)
+    try:
+        meta = doc.get_metadata_dict()
+        n = len(doc)
+        first, last = rng[0], min(rng[1], n)
+        if first > n:
+            raise ValueError(f"{pdf.name} has only {n} pages")
+        with_text = 0
+        for i in range(first - 1, last):
+            page = doc[i]
+            tp = page.get_textpage()
+            if len(tp.get_text_range().strip()) >= TEXT_PAGE_MIN_CHARS:
+                with_text += 1
+            tp.close()
+            page.close()
+        if cover_to is not None:
+            page = doc[min(max(cover_page or first, 1), n) - 1]
+            scale = COVER_HEIGHT_PX / max(page.get_height(), 1)
+            img = page.render(scale=scale).to_pil().convert("RGB")
+            img.save(cover_to, "JPEG", quality=85)
+            page.close()
+    finally:
+        doc.close()
+    return {
+        "title": clean_meta(meta.get("Title")),
+        "author": clean_meta(meta.get("Author")),
+        "pages": last - first + 1,
+        "total_pages": n,
+        "with_text": with_text,
+    }
+
+
+def build_converter(args: argparse.Namespace):
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import (
+        HeadingHierarchyOptions,
+        OcrAutoOptions,
+        OcrMode,
+        PdfPipelineOptions,
+    )
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+
+    ocr_kwargs: dict = {"replace_broken_text_layer": True}
+    if args.force_ocr:
+        ocr_kwargs["mode"] = OcrMode.FULL_PAGE
+    if args.lang:
+        ocr_kwargs["lang"] = [f"iso:{code}" for code in args.lang]
+
+    if sys.platform == "darwin":
+        from docling.datamodel.pipeline_options import OcrMacOptions
+        ocr_options = OcrMacOptions(**ocr_kwargs)
+    else:
+        ocr_options = OcrAutoOptions(**ocr_kwargs)
+
+    opts = PdfPipelineOptions(
+        do_ocr=not args.no_ocr,
+        ocr_options=ocr_options,
+        do_table_structure=True,
+        generate_picture_images=True,
+        images_scale=2.0,
+        heading_hierarchy_options=HeadingHierarchyOptions(enabled=True),
+    )
+    return DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)})
+
+
+def progress_printer(total: int):
+    started = time.monotonic()
+
+    def cb(event) -> None:
+        if getattr(event, "kind", None) != "page_completed":
+            return
+        done = event.completed_pages
+        tot = event.total_pages or total
+        rate = (time.monotonic() - started) / max(done, 1)
+        eta = int(rate * (tot - done))
+        log(f"\r  converting  page {done}/{tot}   ~{eta // 60}m{eta % 60:02d}s left   ", end="")
+
+    return cb
+
+
+def convert_one(converter, pdf: Path, out: Path, args: argparse.Namespace) -> bool:
+    from docling.datamodel.base_models import ConversionStatus
+    from docling_core.types.doc import ImageRefMode
+
+    rng = args.pages
+    keep_dir = out.with_name(out.stem + ".pdf2epub")
+    tmp_ctx = None
+    if args.keep:
+        if keep_dir.exists():
+            if not (keep_dir / "book.md").exists() and any(keep_dir.iterdir()):
+                raise ValueError(f"{keep_dir} exists and wasn't made by pdf2epub; not touching it")
+            shutil.rmtree(keep_dir)
+        keep_dir.mkdir(parents=True)
+        work = keep_dir
+    else:
+        tmp_ctx = tempfile.TemporaryDirectory(prefix="pdf2epub-")
+        work = Path(tmp_ctx.name)
+
+    try:
+        t0 = time.monotonic()
+        cover = None if args.no_cover else work / "cover.jpg"
+        info = inspect_pdf(pdf, rng, cover, args.cover_page)
+        scanned = info["pages"] - info["with_text"]
+        if args.no_ocr:
+            route = "text layer only (OCR off)"
+        elif args.force_ocr:
+            route = "OCR on every page (forced)"
+        elif scanned == 0:
+            route = "all have a text layer -> read directly; OCR only for images"
+        elif info["with_text"] == 0:
+            route = "no text layer (scanned) -> OCR on every page"
+        else:
+            route = f"{plural(info['with_text'], 'page')} read directly, {scanned} without text -> OCR"
+        log(f"  {plural(info['pages'], 'page')} · {route}")
+
+        res = converter.convert(
+            pdf,
+            page_range=rng,
+            raises_on_error=False,
+            progress_callback=progress_printer(info["pages"]),
+        )
+        log("\r" + " " * 70 + "\r", end="")
+        if res.status not in (ConversionStatus.SUCCESS, ConversionStatus.PARTIAL_SUCCESS):
+            errs = "; ".join(e.error_message for e in (res.errors or [])) or res.status.value
+            log(f"  FAILED: {errs}")
+            return False
+        if res.status == ConversionStatus.PARTIAL_SUCCESS:
+            log(f"  warning: some pages failed ({len(res.errors or [])} errors), continuing")
+
+        doc = res.document
+        md = work / "book.md"
+        doc.save_as_markdown(md, artifacts_dir=Path("images"), image_mode=ImageRefMode.REFERENCED)
+
+        guessed = guess_title(doc, 1) if rng[0] == 1 else None
+        title = args.title or info["title"] or guessed or pretty_stem(pdf)
+        md.write_text(normalize_headings(md.read_text(encoding="utf-8"), title), encoding="utf-8")
+        author = args.author or info["author"]
+        lang = args.lang[0] if args.lang else None
+
+        cmd = [
+            "pandoc", str(md),
+            "--from", "markdown-yaml_metadata_block",
+            "--to", "epub3",
+            "--output", str(out),
+            "--resource-path", str(work),
+            "--toc", "--toc-depth=2",
+            f"--split-level={args.chapter_level}",
+            "--mathml",
+            "--metadata", f"title={title}",
+        ]
+        if author:
+            cmd += ["--metadata", f"author={author}"]
+        if lang:
+            cmd += ["--metadata", f"lang={lang}"]
+        if cover is not None and cover.exists():
+            cmd += ["--epub-cover-image", str(cover)]
+        out.parent.mkdir(parents=True, exist_ok=True)
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            log(f"  pandoc FAILED:\n{r.stderr.strip()}")
+            return False
+
+        secs = int(time.monotonic() - t0)
+        size = out.stat().st_size / 1e6
+        log(f"  done in {secs // 60}m{secs % 60:02d}s -> {out}  ({size:.1f} MB)")
+        log(f"  title: {title}" + (f"  ·  author: {author}" if author else ""))
+        if args.keep:
+            log(f"  markdown kept in {keep_dir}")
+        return True
+    finally:
+        if tmp_ctx is not None:
+            tmp_ctx.cleanup()
+
+
+def main() -> int:
+    args = parse_args()
+    if not shutil.which("pandoc"):
+        log("pdf2epub: error: pandoc is not installed (macOS: brew install pandoc, "
+            "others: https://pandoc.org/installing.html)")
+        return 1
+
+    jobs, failed = [], []
+    for given in args.pdfs:
+        pdf = given.expanduser().resolve()
+        problem = check_pdf(pdf)
+        if problem:
+            log(f"pdf2epub: error: {given}: {problem}")
+            failed.append((given, problem))
+            continue
+        out = output_path(pdf, args.output)
+        if out.exists() and not args.overwrite:
+            log(f"skip {given}: {out} already exists (add --overwrite to replace it)")
+            continue
+        jobs.append((pdf, out))
+    if not jobs:
+        if failed:
+            log("nothing to convert (pdf2epub -h for help)")
+            return 2
+        log("nothing to convert")
+        return 0
+
+    # Docling, torch and Hugging Face are chatty; keep real errors only.
+    for var, val in {"TOKENIZERS_PARALLELISM": "false", "HF_HUB_VERBOSITY": "error",
+                     "TRANSFORMERS_VERBOSITY": "error"}.items():
+        os.environ.setdefault(var, val)
+    warnings.filterwarnings("ignore")
+    logging.basicConfig(level=logging.ERROR, format="  %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("torch.distributed.elastic.multiprocessing.redirects").setLevel(logging.ERROR)
+
+    log("loading Docling models (first run downloads them, ~1 min)...")
+    converter = build_converter(args)
+    try:
+        from transformers.utils import logging as hf_logging
+        hf_logging.disable_progress_bar()
+    except Exception:
+        pass
+
+    ok = 0
+    for i, (pdf, out) in enumerate(jobs, 1):
+        log(f"[{i}/{len(jobs)}] {pdf.name}")
+        try:
+            if convert_one(converter, pdf, out, args):
+                ok += 1
+            else:
+                failed.append((pdf.name, "conversion failed (see above)"))
+        except Exception as e:  # keep going with the rest of a batch
+            log(f"  FAILED: {e}")
+            failed.append((pdf.name, str(e)))
+    if len(jobs) + len(failed) > 1:
+        log(f"\n{ok} converted, {len(failed)} not converted")
+    for name, why in failed:
+        log(f"  not converted: {name}: {why}")
+    return 0 if not failed else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        log("\ninterrupted")
+        sys.exit(130)

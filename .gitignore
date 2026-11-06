@@ -1,0 +1,9 @@
+# inputs and outputs never belong in the repo
+*.pdf
+*.epub
+*.pdf2epub/
+
+__pycache__/
+.pytest_cache/
+.venv/
+.DS_Store
