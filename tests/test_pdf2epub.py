@@ -76,6 +76,93 @@ def test_no_headings_is_fine():
     assert p2e.normalize_headings("just text\n\nmore text", "x") == "just text\n\nmore text"
 
 
+# --- Markdown input ----------------------------------------------------------------
+
+def test_authored_lone_h1_title_is_dropped_and_sections_become_chapters():
+    md = "# My Notes\n\n## One\n\ntext\n\n## Two\n\n### Detail\n"
+    out = p2e.normalize_authored_headings(md, "My Notes")
+    assert headings(out) == ["# One", "# Two", "## Detail"]
+
+
+def test_authored_multiple_h1_are_the_authors_chapters():
+    md = "# Starter\n\n## Feeding\n\n# Baking\n\n# Appendix\n"
+    assert p2e.normalize_authored_headings(md, "Field Guide") == md
+
+
+def test_authored_h1_kept_when_it_is_not_the_title():
+    md = "# Something else\n\n## One\n"
+    assert p2e.normalize_authored_headings(md, "Front matter title") == md
+
+
+def test_authored_yaml_comments_are_not_headings():
+    md = "---\ntitle: X\n# a yaml comment\n---\n\n## One\n\n## Two\n"
+    out = p2e.normalize_authored_headings(md, "X")
+    assert "# a yaml comment" in out
+    assert headings(out)[1:] == ["# One", "# Two"]
+
+
+def test_lone_h1():
+    assert p2e.lone_h1("# Title\n\n## a\n") == "Title"
+    assert p2e.lone_h1("## a\n\n# Late\n") is None
+    assert p2e.lone_h1("# A\n\n# B\n") is None
+
+
+def obsidian(md, files=None):
+    files = files or {}
+    missing = []
+    out = p2e.obsidian_to_markdown(md, lambda name: files.get(name), missing)
+    return out, missing
+
+
+def test_obsidian_links_become_text():
+    out, _ = obsidian("See [[Note]], [[Other|the other]] and [[Deep#Section]] and [[#Local]].")
+    assert out == "See Note, the other and Deep and Local."
+
+
+def test_obsidian_image_embeds_resolve_and_width_is_not_alt_text():
+    files = {"a.png": Path("/v/a.png"), "b.png": Path("/v/x/b.png")}
+    out, missing = obsidian("![[a.png]]\n![[b.png|300]]\n![[c.png|caption]]", files)
+    assert out.split("\n")[:2] == ["![](</v/a.png>)", "![](</v/x/b.png>)"]
+    assert missing == ["c.png"]
+
+
+def test_obsidian_note_embeds_become_text():
+    out, missing = obsidian("![[Another note]]")
+    assert out == "Another note" and missing == []
+
+
+def test_obsidian_callouts_comments_and_code():
+    md = "> [!warning] Budget\n> over\n\n> [!tip]\n%% secret %%\n%%\nblock secret\n%%\n" \
+         "`x[[0]]`\n```\ny[[1]]\n```"
+    out, _ = obsidian(md)
+    assert "> **Budget**\n>\n> over" in out
+    assert "> **Tip**" in out
+    assert "secret" not in out
+    assert "`x[[0]]`" in out and "y[[1]]" in out
+
+
+def test_attachment_finder_searches_the_vault(tmp_path):
+    (tmp_path / ".obsidian").mkdir()
+    (tmp_path / "notes").mkdir()
+    (tmp_path / "files" / "deep").mkdir(parents=True)
+    img = tmp_path / "files" / "deep" / "Pasted image.png"
+    img.write_bytes(b"png")
+    note = tmp_path / "notes" / "n.md"
+    note.write_text("x")
+    find = p2e.attachment_finder(note)
+    assert find("Pasted image.png") == img
+    assert find("nope.png") is None
+
+
+def test_attachment_finder_outside_a_vault_only_looks_next_to_the_file(tmp_path):
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "far.png").write_bytes(b"png")
+    (tmp_path / "near.png").write_bytes(b"png")
+    find = p2e.attachment_finder(tmp_path / "doc.md")
+    assert find("near.png") == (tmp_path / "near.png").resolve()
+    assert find("far.png") is None
+
+
 # --- metadata and titles --------------------------------------------------------
 
 @pytest.mark.parametrize("junk", [None, "", "untitled", "Microsoft Word - thesis.docx",
@@ -123,12 +210,18 @@ def test_output_path(tmp_path):
     assert p2e.output_path(pdf, tmp_path / "x.epub") == tmp_path / "x.epub"
 
 
-def test_check_pdf(tmp_path):
-    good = tmp_path / "a.pdf"
-    good.write_bytes(b"%PDF-1.7\n...")
-    text = tmp_path / "notes.txt"
-    text.write_text("hello")
-    assert p2e.check_pdf(good) is None
-    assert p2e.check_pdf(text) == "is not a PDF"
-    assert p2e.check_pdf(tmp_path / "missing.pdf") == "no such file"
-    assert "folder" in p2e.check_pdf(tmp_path)
+def test_check_input(tmp_path):
+    pdf = tmp_path / "a.pdf"
+    pdf.write_bytes(b"%PDF-1.7\n...")
+    md = tmp_path / "notes.md"
+    md.write_text("# hi")
+    txt = tmp_path / "notes.txt"
+    txt.write_text("hello")
+    fake = tmp_path / "image.md"
+    fake.write_bytes(b"\x89PNG\x00\x00")
+    assert p2e.check_input(pdf) == ("pdf", None)
+    assert p2e.check_input(md) == ("markdown", None)
+    assert p2e.check_input(txt) == (None, "is not a PDF or Markdown (.md) file")
+    assert p2e.check_input(fake)[0] is None
+    assert p2e.check_input(tmp_path / "missing.pdf") == (None, "no such file")
+    assert "folder" in p2e.check_input(tmp_path)[1]

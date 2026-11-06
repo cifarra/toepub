@@ -6,19 +6,39 @@
 #   "ocrmac>=1.0; sys_platform == 'darwin'",
 # ]
 # ///
-"""pdf2epub - convert PDF books and documents to EPUB (Docling + pandoc).
+"""pdf2epub - convert PDF and Markdown books and documents to EPUB.
 
-Routing is automatic and per page:
-  * pages with a real text layer      -> text is read directly (fast, exact)
-  * scanned pages / pictures of text  -> OCR (Apple Vision on macOS)
-  * pages with a broken text layer    -> re-read with full-page OCR
-Docling then rebuilds reading order, chapters/sections, tables and figures,
-drops running headers/footers/page numbers, and pandoc packages it as EPUB 3
-with a table of contents and a cover made from the first page.
+PDF: routed automatically, page by page
+  pages with a real text layer      -> text is read directly (fast, exact)
+  scanned pages / pictures of text  -> OCR (Apple Vision on macOS)
+  pages with a broken text layer    -> re-read with full-page OCR
+  Docling rebuilds reading order, chapters, tables and figures and drops
+  running headers, footers and page numbers. The cover is the first page.
+
+Markdown (.md): straight to pandoc, no models, about a second
+  Front matter (optional):
+      ---
+      title: My Book
+      author: [Ana Pérez, Bo Chen]       # one name or a list
+      lang: es
+      cover-image: images/cover.jpg      # relative to the .md file
+      ---
+  Title      front matter title, else a lone first "# Heading", else file name
+  Chapters   one "# Title" + "## Sections"  -> the sections become chapters
+             several "# Headings"           -> each is a chapter, as written
+  Images     ![alt](relative/path.png) is embedded in the book
+  Kept       tables, code blocks, $math$, ==highlights==
+  Obsidian   ![[img.png]], ![[img.png|300]] -> the image, searched in the vault
+             [[Note]], [[Note|alias]]       -> plain text
+             > [!tip] Title                 -> quote with a bold title
+             %% comment %%                  -> removed
+  Embeds that can't be found are reported and left as text.
+  Each .md file becomes its own book.
 
 Examples:
   pdf2epub book.pdf
-  pdf2epub *.pdf -o ~/Books
+  pdf2epub notes.md
+  pdf2epub *.pdf *.md -o ~/Books
   pdf2epub scan.pdf --lang es --force-ocr
   pdf2epub book.pdf --pages 1-20 --keep      # quick test, keep the markdown
 """
@@ -61,7 +81,8 @@ class Parser(argparse.ArgumentParser):
         if m:
             for tok in m.group(1).split():
                 if tok.startswith("-"):
-                    close = difflib.get_close_matches(tok.split("=")[0], list(self._option_string_actions), n=1)
+                    close = difflib.get_close_matches(tok.split("=")[0], list(self._option_string_actions),
+                                                      n=1, cutoff=0.7)
                     if close:
                         hints.append(f"did you mean {close[0]} instead of {tok}?")
         log(f"\npdf2epub: error: {message}")
@@ -109,28 +130,32 @@ def parse_args() -> argparse.Namespace:
         epilog=__doc__.split("\n\n", 1)[1],
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("pdfs", nargs="+", type=Path, help="PDF file(s) to convert")
+    p.add_argument("files", nargs="+", type=Path, metavar="FILE",
+                   help="PDF or Markdown (.md) file(s) to convert")
     p.add_argument("-o", "--output", type=Path,
-                   help="output .epub file, or a directory (default: next to each PDF)")
-    p.add_argument("--title", help="book title (default: PDF metadata, then detected title)")
-    p.add_argument("--author", help="author (default: PDF metadata)")
+                   help="output .epub file, or a directory (default: next to each input)")
+    p.add_argument("--title", help="book title (default: metadata / front matter, then detected)")
+    p.add_argument("--author", help="author (default: metadata / front matter)")
     p.add_argument("--lang", type=lang_arg, help="language(s), comma-separated, most likely first, "
                    "e.g. 'es' or 'en,es'. Guides OCR and sets the EPUB language")
-    p.add_argument("--force-ocr", action="store_true",
-                   help="OCR every page and ignore the PDF text layer "
-                        "(use when an old scan has a bad embedded OCR layer)")
-    p.add_argument("--no-ocr", action="store_true",
-                   help="never OCR; text layer only (fastest, for born-digital PDFs)")
-    p.add_argument("--pages", type=pages_arg, default=(1, sys.maxsize), metavar="RANGE",
-                   help="page range: 5, 1-50 or 10- (default: all)")
+    p.add_argument("--cover-image", type=Path, metavar="IMAGE",
+                   help="use this image as the cover (default: PDF first page / front matter)")
     p.add_argument("--chapter-level", type=int_arg(1, 6), default=1, metavar="N",
                    help="split the EPUB into files at heading level N, 1-6 (default: 1)")
-    p.add_argument("--cover-page", type=int_arg(1, 100_000), metavar="N",
-                   help="page to use as the cover (default: first page)")
-    p.add_argument("--no-cover", action="store_true", help="don't add a cover image")
-    p.add_argument("--keep", action="store_true",
-                   help="keep the intermediate markdown + images in <name>.pdf2epub/")
     p.add_argument("--overwrite", action="store_true", help="replace an existing .epub")
+    pdf = p.add_argument_group("PDF only")
+    pdf.add_argument("--force-ocr", action="store_true",
+                     help="OCR every page and ignore the PDF text layer "
+                          "(use when an old scan has a bad embedded OCR layer)")
+    pdf.add_argument("--no-ocr", action="store_true",
+                     help="never OCR; text layer only (fastest, for born-digital PDFs)")
+    pdf.add_argument("--pages", type=pages_arg, default=(1, sys.maxsize), metavar="RANGE",
+                     help="page range: 5, 1-50 or 10- (default: all)")
+    pdf.add_argument("--cover-page", type=int_arg(1, 100_000), metavar="N",
+                     help="page to use as the cover (default: first page)")
+    pdf.add_argument("--no-cover", action="store_true", help="don't add a cover image")
+    pdf.add_argument("--keep", action="store_true",
+                     help="keep the intermediate markdown + images in <name>.pdf2epub/")
     if len(sys.argv) == 1:
         p.print_help(sys.stderr)
         sys.exit(2)
@@ -139,35 +164,48 @@ def parse_args() -> argparse.Namespace:
         p.error("--force-ocr and --no-ocr are mutually exclusive")
     if a.output:
         a.output = a.output.expanduser().resolve()
-        if len(a.pdfs) > 1 and a.output.suffix.lower() == ".epub":
-            p.error("with several PDFs, --output must be a directory, not an .epub file")
+        if len(a.files) > 1 and a.output.suffix.lower() == ".epub":
+            p.error("with several files, --output must be a directory, not an .epub file")
         if a.output.is_file() and a.output.suffix.lower() != ".epub":
             p.error(f"--output {a.output} is an existing file; give an .epub path or a directory")
+    if a.cover_image:
+        a.cover_image = a.cover_image.expanduser().resolve()
+        if not a.cover_image.is_file():
+            p.error(f"--cover-image {a.cover_image}: no such file")
+        if a.cover_image.suffix.lower() not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
+            p.error("--cover-image must be a .jpg, .png, .gif or .webp image")
     return a
 
 
-def check_pdf(path: Path) -> str | None:
-    """Why this path can't be converted, or None if it looks like a PDF."""
+MARKDOWN_EXTS = {".md", ".markdown", ".mdown", ".mkd", ".mkdn"}
+
+
+def check_input(path: Path) -> tuple[str | None, str | None]:
+    """(kind, problem): kind is 'pdf' or 'markdown'; problem says why we can't."""
     if not path.exists():
-        return "no such file"
+        return None, "no such file"
     if path.is_dir():
-        return "is a folder (to convert everything in it: pdf2epub folder/*.pdf)"
+        return None, "is a folder (to convert everything in it: pdf2epub folder/*.pdf folder/*.md)"
     try:
         with path.open("rb") as f:
             head = f.read(1024)
     except OSError as e:
-        return f"can't read it ({e.strerror})"
-    if b"%PDF" not in head:
-        return "is not a PDF"
-    return None
+        return None, f"can't read it ({e.strerror})"
+    if b"%PDF" in head:
+        return "pdf", None
+    if path.suffix.lower() in MARKDOWN_EXTS:
+        if b"\x00" in head:
+            return None, "has a Markdown extension but is a binary file"
+        return "markdown", None
+    return None, "is not a PDF or Markdown (.md) file"
 
 
-def output_path(pdf: Path, out: Path | None) -> Path:
+def output_path(src: Path, out: Path | None) -> Path:
     if out is None:
-        return pdf.with_suffix(".epub")
+        return src.with_suffix(".epub")
     if out.suffix.lower() == ".epub":
         return out
-    return out / (pdf.stem + ".epub")
+    return out / (src.stem + ".epub")
 
 
 def clean_meta(value: str | None) -> str | None:
@@ -230,6 +268,19 @@ HEADING = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
 FENCE = re.compile(r"^\s*(```|~~~)")
 
 
+def scan_headings(lines: list[str], start: int = 0) -> list[list]:
+    """[line index, level, text] for each ATX heading outside code blocks."""
+    heads, in_code = [], False
+    for i in range(start, len(lines)):
+        if FENCE.match(lines[i]):
+            in_code = not in_code
+            continue
+        m = None if in_code else HEADING.match(lines[i])
+        if m:
+            heads.append([i, len(m.group(1)), m.group(2)])
+    return heads
+
+
 def chapter_level(heads: list, n_lines: int) -> int:
     """The shallowest heading level that recurs through the whole book.
     Big type on a title page or a stray mislabelled footnote can claim the top
@@ -251,14 +302,7 @@ def normalize_headings(md: str, title: str) -> str:
     shift so chapters are '#', which pandoc splits into files and puts at the
     top of the table of contents."""
     lines = md.split("\n")
-    heads, in_code = [], False
-    for i, line in enumerate(lines):
-        if FENCE.match(line):
-            in_code = not in_code
-            continue
-        m = None if in_code else HEADING.match(line)
-        if m:
-            heads.append([i, len(m.group(1)), m.group(2)])
+    heads = scan_headings(lines)
     # In Docling markdown '#' only ever means its 'title' label. A book has one
     # title, before any other heading; later ones are misread footnotes or
     # captions, so turn them back into plain text.
@@ -280,6 +324,218 @@ def normalize_headings(md: str, title: str) -> str:
     for i, level, text in heads:
         lines[i] = "#" * (max(level, top) - top + 1) + " " + text
     return "\n".join(lines)
+
+
+# --- Markdown input -------------------------------------------------------------
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp", ".avif"}
+EMBED = re.compile(r"!\[\[([^\]\n]+)\]\]")
+WIKILINK = re.compile(r"\[\[([^\]\n]+)\]\]")
+CALLOUT = re.compile(r"^(\s*>\s*)\[!([\w-]+)\][+-]?\s*(.*)$")
+INLINE_CODE = re.compile(r"(`+[^`\n]*`+)")
+
+
+def front_matter_end(lines: list[str]) -> int:
+    """Index of the first line after a leading YAML block (0 if there is none)."""
+    if lines and lines[0].strip() == "---":
+        for i in range(1, len(lines)):
+            if lines[i].strip() in ("---", "..."):
+                return i + 1
+    return 0
+
+
+def lone_h1(md: str) -> str | None:
+    """The document's title-like H1: the first heading, and the only '#' one."""
+    lines = md.split("\n")
+    heads = scan_headings(lines, front_matter_end(lines))
+    h1 = [h for h in heads if h[1] == 1]
+    if len(h1) == 1 and heads[0] is h1[0]:
+        return h1[0][2]
+    return None
+
+
+def normalize_authored_headings(md: str, title: str) -> str:
+    """Hand-written Markdown: trust the author's levels, with two fixes. A lone
+    leading '# Title' that repeats the book title is dropped (pandoc makes the
+    title page) and, like '##'-only documents, its sections move up so they
+    become chapters. Several '#' headings are the author's chapters: untouched."""
+    lines = md.split("\n")
+    heads = scan_headings(lines, front_matter_end(lines))
+    h1 = [h for h in heads if h[1] == 1]
+    if len(h1) == 1 and heads[0] is h1[0] and _norm(h1[0][2]) == _norm(title):
+        lines[h1[0][0]] = ""
+        heads = heads[1:]
+    elif h1:
+        return md
+    if heads:
+        shift = min(h[1] for h in heads) - 1
+        for i, level, text in heads:
+            lines[i] = "#" * (level - shift) + " " + text
+    return "\n".join(lines)
+
+
+def attachment_finder(md_path: Path):
+    """Resolve Obsidian-style embed names: next to the note first, then (inside an
+    Obsidian vault only) anywhere in the vault, as Obsidian itself does."""
+    base = md_path.parent
+    vault = next((d for d in (base, *base.parents) if (d / ".obsidian").is_dir()), None)
+    index: dict[str, Path] | None = None
+
+    def find(name: str) -> Path | None:
+        nonlocal index
+        for root in (base, vault):
+            if root is not None and (root / name).is_file():
+                return (root / name).resolve()
+        if vault is None:
+            return None
+        if index is None:
+            index = {}
+            for f in vault.rglob("*"):
+                if f.suffix.lower() in IMAGE_EXTS and not any(
+                        part.startswith(".") for part in f.relative_to(vault).parts):
+                    index.setdefault(f.name.lower(), f)
+        return index.get(Path(name).name.lower())
+
+    return find
+
+
+def obsidian_to_markdown(md: str, find_file, missing: list[str]) -> str:
+    """Obsidian syntax that pandoc would print literally:
+    ![[img.png|alt]] -> image, ![[Other note]] / [[Note#Heading|alias]] -> text
+    (other notes aren't in the book), > [!note] Title -> bold callout title,
+    %% comments %% -> removed. Code blocks and inline code are left alone."""
+
+    def target_and_alias(inner: str) -> tuple[str, str]:
+        target, _, alias = inner.partition("|")
+        return target.strip(), alias.strip()
+
+    def link_text(inner: str) -> str:
+        target, alias = target_and_alias(inner)
+        if alias:
+            return alias
+        note, _, heading = target.partition("#")
+        return note or heading.lstrip("^")
+
+    def embed(m: re.Match) -> str:
+        target, alias = target_and_alias(m.group(1))
+        name = target.split("#")[0]
+        if Path(name).suffix.lower() in IMAGE_EXTS:
+            path = find_file(name)
+            if path is None:
+                missing.append(name)
+                return name
+            alt = "" if re.fullmatch(r"\d+(x\d+)?", alias) else alias  # |300 is a width
+            return f"![{alt}](<{path}>)"
+        return link_text(m.group(1))
+
+    out, in_code, in_comment = [], False, False
+    for line in md.split("\n"):
+        if FENCE.match(line) and not in_comment:
+            in_code = not in_code
+        elif not in_code:
+            if line.strip() == "%%":
+                in_comment = not in_comment
+                continue
+            if in_comment:
+                continue
+            parts = INLINE_CODE.split(line)
+            for k in range(0, len(parts), 2):  # even parts are outside `code`
+                p = re.sub(r"%%.*?%%", "", parts[k])
+                p = EMBED.sub(embed, p)
+                parts[k] = WIKILINK.sub(lambda m: link_text(m.group(1)), p)
+            line = "".join(parts)
+            m = CALLOUT.match(line)
+            if m:  # title as its own paragraph inside the quote
+                line = f"{m.group(1)}**{m.group(3) or m.group(2).capitalize()}**\n{m.group(1).rstrip()}"
+        out.append(line)
+    return "\n".join(out)
+
+
+MARKDOWN_FROM = "markdown+mark"
+
+
+def front_matter(src: Path) -> tuple[str | None, str | None]:
+    """(title, author) from the YAML front matter, as pandoc reads them."""
+    with tempfile.TemporaryDirectory(prefix="pdf2epub-") as d:
+        tpl = Path(d) / "meta.plain"
+        tpl.write_text("$title$\x1e$for(author)$$author$$sep$; $endfor$", encoding="utf-8")
+        r = subprocess.run(["pandoc", str(src), "--from", MARKDOWN_FROM, "--to", "plain",
+                            "--template", str(tpl)], capture_output=True, text=True)
+    if r.returncode != 0:
+        return None, None
+    title, _, author = r.stdout.partition("\x1e")
+    return title.strip() or None, author.strip() or None
+
+
+def convert_markdown(src: Path, out: Path, args: argparse.Namespace) -> bool:
+    t0 = time.monotonic()
+    try:
+        text = src.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        text = src.read_text(encoding="latin-1")
+
+    missing: list[str] = []
+    text = obsidian_to_markdown(text, attachment_finder(src), missing)
+    with tempfile.TemporaryDirectory(prefix="pdf2epub-") as d:
+        md = Path(d) / "book.md"
+        md.write_text(text, encoding="utf-8")
+        front_title, front_author = front_matter(md)
+        title = args.title or front_title or lone_h1(text) or pretty_stem(src)
+        md.write_text(normalize_authored_headings(text, title), encoding="utf-8")
+        log("  markdown -> pandoc" + (f" · {plural(len(missing), 'embedded image')} not found: "
+                                      + ", ".join(missing[:5]) if missing else ""))
+        ok = run_pandoc(
+            md, out, args,
+            from_fmt=MARKDOWN_FROM,
+            cwd=src.parent,  # relative image paths and cover-image resolve next to the .md
+            title=None if front_title and not args.title else title,
+            author=args.author,
+            lang=args.lang[0] if args.lang else None,
+            cover=args.cover_image,
+        )
+    if ok:
+        report_done(out, t0, title, args.author or front_author)
+    return ok
+
+
+# --- pandoc -----------------------------------------------------------------------
+
+def run_pandoc(src: Path, out: Path, args: argparse.Namespace, *, from_fmt: str, cwd: Path,
+               title: str | None, author: str | None, lang: str | None,
+               cover: Path | None) -> bool:
+    """Write the EPUB. title/author/lang given here override the document's own."""
+    cmd = [
+        "pandoc", str(src),
+        "--from", from_fmt,
+        "--to", "epub3",
+        "--output", str(out),
+        "--toc", "--toc-depth=2",
+        f"--split-level={args.chapter_level}",
+        "--mathml",
+    ]
+    for key, value in (("title", title), ("author", author), ("lang", lang)):
+        if value:
+            cmd += ["--metadata", f"{key}={value}"]
+    if cover is not None and cover.exists():
+        cmd += ["--epub-cover-image", str(cover)]
+    out.parent.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
+    if r.returncode != 0:
+        log(f"  pandoc FAILED:\n{r.stderr.strip()}")
+        return False
+    warnings_ = sorted({line.strip() for line in r.stderr.splitlines() if "[WARNING]" in line})
+    for w in warnings_[:5]:
+        log(f"  {w}")
+    if len(warnings_) > 5:
+        log(f"  ... and {len(warnings_) - 5} more pandoc warnings")
+    return True
+
+
+def report_done(out: Path, t0: float, title: str, author: str | None) -> None:
+    secs = int(time.monotonic() - t0)
+    size = out.stat().st_size / 1e6
+    log(f"  done in {secs // 60}m{secs % 60:02d}s -> {out}  ({size:.1f} MB)")
+    log(f"  title: {title}" + (f"  ·  author: {author}" if author else ""))
 
 
 def inspect_pdf(pdf: Path, rng: tuple[int, int], cover_to: Path | None, cover_page: int | None):
@@ -366,7 +622,7 @@ def progress_printer(total: int):
     return cb
 
 
-def convert_one(converter, pdf: Path, out: Path, args: argparse.Namespace) -> bool:
+def convert_pdf(converter, pdf: Path, out: Path, args: argparse.Namespace) -> bool:
     from docling.datamodel.base_models import ConversionStatus
     from docling_core.types.doc import ImageRefMode
 
@@ -386,7 +642,7 @@ def convert_one(converter, pdf: Path, out: Path, args: argparse.Namespace) -> bo
 
     try:
         t0 = time.monotonic()
-        cover = None if args.no_cover else work / "cover.jpg"
+        cover = None if (args.no_cover or args.cover_image) else work / "cover.jpg"
         info = inspect_pdf(pdf, rng, cover, args.cover_page)
         scanned = info["pages"] - info["with_text"]
         if args.no_ocr:
@@ -423,35 +679,20 @@ def convert_one(converter, pdf: Path, out: Path, args: argparse.Namespace) -> bo
         title = args.title or info["title"] or guessed or pretty_stem(pdf)
         md.write_text(normalize_headings(md.read_text(encoding="utf-8"), title), encoding="utf-8")
         author = args.author or info["author"]
-        lang = args.lang[0] if args.lang else None
 
-        cmd = [
-            "pandoc", str(md),
-            "--from", "markdown-yaml_metadata_block",
-            "--to", "epub3",
-            "--output", str(out),
-            "--resource-path", str(work),
-            "--toc", "--toc-depth=2",
-            f"--split-level={args.chapter_level}",
-            "--mathml",
-            "--metadata", f"title={title}",
-        ]
-        if author:
-            cmd += ["--metadata", f"author={author}"]
-        if lang:
-            cmd += ["--metadata", f"lang={lang}"]
-        if cover is not None and cover.exists():
-            cmd += ["--epub-cover-image", str(cover)]
-        out.parent.mkdir(parents=True, exist_ok=True)
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0:
-            log(f"  pandoc FAILED:\n{r.stderr.strip()}")
+        ok = run_pandoc(
+            md, out, args,
+            # Docling output is plain text: a line of '---' must not start YAML
+            from_fmt="markdown-yaml_metadata_block",
+            cwd=work,
+            title=title,
+            author=author,
+            lang=args.lang[0] if args.lang else None,
+            cover=args.cover_image or cover,
+        )
+        if not ok:
             return False
-
-        secs = int(time.monotonic() - t0)
-        size = out.stat().st_size / 1e6
-        log(f"  done in {secs // 60}m{secs % 60:02d}s -> {out}  ({size:.1f} MB)")
-        log(f"  title: {title}" + (f"  ·  author: {author}" if author else ""))
+        report_done(out, t0, title, author)
         if args.keep:
             log(f"  markdown kept in {keep_dir}")
         return True
@@ -467,19 +708,22 @@ def main() -> int:
             "others: https://pandoc.org/installing.html)")
         return 1
 
-    jobs, failed = [], []
-    for given in args.pdfs:
-        pdf = given.expanduser().resolve()
-        problem = check_pdf(pdf)
+    jobs, failed, claimed = [], [], {}
+    for given in args.files:
+        src = given.expanduser().resolve()
+        kind, problem = check_input(src)
+        out = output_path(src, args.output) if kind else None
+        if out in claimed:
+            problem = f"would write the same {out.name} as {claimed[out]}; convert it separately"
         if problem:
             log(f"pdf2epub: error: {given}: {problem}")
             failed.append((given, problem))
             continue
-        out = output_path(pdf, args.output)
+        claimed[out] = given
         if out.exists() and not args.overwrite:
             log(f"skip {given}: {out} already exists (add --overwrite to replace it)")
             continue
-        jobs.append((pdf, out))
+        jobs.append((kind, src, out))
     if not jobs:
         if failed:
             log("nothing to convert (pdf2epub -h for help)")
@@ -487,33 +731,37 @@ def main() -> int:
         log("nothing to convert")
         return 0
 
-    # Docling, torch and Hugging Face are chatty; keep real errors only.
-    for var, val in {"TOKENIZERS_PARALLELISM": "false", "HF_HUB_VERBOSITY": "error",
-                     "TRANSFORMERS_VERBOSITY": "error"}.items():
-        os.environ.setdefault(var, val)
-    warnings.filterwarnings("ignore")
-    logging.basicConfig(level=logging.ERROR, format="  %(levelname)s %(name)s: %(message)s")
-    logging.getLogger("torch.distributed.elastic.multiprocessing.redirects").setLevel(logging.ERROR)
+    converter = None
+    if any(kind == "pdf" for kind, _, _ in jobs):  # Markdown never needs Docling
+        # Docling, torch and Hugging Face are chatty; keep real errors only.
+        for var, val in {"TOKENIZERS_PARALLELISM": "false", "HF_HUB_VERBOSITY": "error",
+                         "TRANSFORMERS_VERBOSITY": "error"}.items():
+            os.environ.setdefault(var, val)
+        warnings.filterwarnings("ignore")
+        logging.basicConfig(level=logging.ERROR, format="  %(levelname)s %(name)s: %(message)s")
+        logging.getLogger("torch.distributed.elastic.multiprocessing.redirects").setLevel(logging.ERROR)
 
-    log("loading Docling models (first run downloads them, ~1 min)...")
-    converter = build_converter(args)
-    try:
-        from transformers.utils import logging as hf_logging
-        hf_logging.disable_progress_bar()
-    except Exception:
-        pass
+        log("loading Docling models (first run downloads them, ~1 min)...")
+        converter = build_converter(args)
+        try:
+            from transformers.utils import logging as hf_logging
+            hf_logging.disable_progress_bar()
+        except Exception:
+            pass
 
     ok = 0
-    for i, (pdf, out) in enumerate(jobs, 1):
-        log(f"[{i}/{len(jobs)}] {pdf.name}")
+    for i, (kind, src, out) in enumerate(jobs, 1):
+        log(f"[{i}/{len(jobs)}] {src.name}")
         try:
-            if convert_one(converter, pdf, out, args):
+            done = (convert_pdf(converter, src, out, args) if kind == "pdf"
+                    else convert_markdown(src, out, args))
+            if done:
                 ok += 1
             else:
-                failed.append((pdf.name, "conversion failed (see above)"))
+                failed.append((src.name, "conversion failed (see above)"))
         except Exception as e:  # keep going with the rest of a batch
             log(f"  FAILED: {e}")
-            failed.append((pdf.name, str(e)))
+            failed.append((src.name, str(e)))
     if len(jobs) + len(failed) > 1:
         log(f"\n{ok} converted, {len(failed)} not converted")
     for name, why in failed:
