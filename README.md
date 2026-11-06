@@ -1,10 +1,10 @@
-# pdf2epub
+# toepub
 
 Turn PDF and Markdown books and documents into clean, reflowable EPUBs with one command.
 
 ```bash
-pdf2epub book.pdf            # -> book.epub
-pdf2epub notes.md            # -> notes.epub
+toepub book.pdf            # -> book.epub
+toepub notes.md            # -> notes.epub
 ```
 
 ## PDF
@@ -44,23 +44,23 @@ You need [uv](https://docs.astral.sh/uv/) and [pandoc](https://pandoc.org/instal
 
 ```bash
 brew install uv pandoc
-git clone https://github.com/cifarra/pdf2epub.git
-ln -s "$PWD/pdf2epub/pdf2epub" ~/.local/bin/pdf2epub   # or any folder on your PATH
-pdf2epub -h
+git clone https://github.com/cifarra/toepub.git
+ln -s "$PWD/toepub/toepub" ~/.local/bin/toepub   # or any folder on your PATH
+toepub -h
 ```
 
-`pdf2epub` is a single self-contained script ([PEP 723](https://peps.python.org/pep-0723/)), so there is no virtualenv to manage. On the first run uv installs Docling and its dependencies (about 1 GB, PyTorch included) into its cache. The first PDF also makes Docling download its layout models. Later runs start right away, and Markdown never loads the models.
+`toepub` is a single self-contained script ([PEP 723](https://peps.python.org/pep-0723/)), so there is no virtualenv to manage. On the first run uv installs Docling and its dependencies (about 1 GB, PyTorch included) into its cache. The first PDF also makes Docling download its layout models. Later runs start right away, and Markdown never loads the models.
 
 ## Usage
 
 ```bash
-pdf2epub book.pdf                         # book.epub next to the PDF
-pdf2epub *.pdf *.md -o ~/Books            # batch into a folder, PDFs and Markdown mixed
-pdf2epub "Vault/Projects/Atlas.md"        # an Obsidian note, embeds included
-pdf2epub scan.pdf --lang es               # Spanish book: guides OCR, sets the EPUB language
-pdf2epub old-scan.pdf --force-ocr         # ignore a bad embedded OCR layer, OCR everything
-pdf2epub book.pdf --cover-page 3          # page 1 is a blank binding? pick another cover
-pdf2epub book.pdf --pages 1-20 --keep     # quick trial, keep the intermediate markdown
+toepub book.pdf                         # book.epub next to the PDF
+toepub *.pdf *.md -o ~/Books            # batch into a folder, PDFs and Markdown mixed
+toepub "Vault/Projects/Atlas.md"        # an Obsidian note, embeds included
+toepub scan.pdf --lang es               # Spanish book: guides OCR, sets the EPUB language
+toepub old-scan.pdf --force-ocr         # ignore a bad embedded OCR layer, OCR everything
+toepub book.pdf --cover-page 3          # page 1 is a blank binding? pick another cover
+toepub book.pdf --pages 1-20 --keep     # quick trial, keep the intermediate markdown
 ```
 
 It reports which route it took before it starts:
@@ -87,7 +87,7 @@ It reports which route it took before it starts:
 | `--no-ocr` | Text layer only, never OCR (fastest, for born-digital PDFs) |
 | `--pages 1-50` | Convert a page range (`5`, `1-50`, `10-`) |
 | `--cover-page N` / `--no-cover` | Choose which page becomes the cover, or skip the cover |
-| `--keep` | Keep the intermediate markdown and images in `<name>.pdf2epub/` |
+| `--keep` | Keep the intermediate markdown and images in `<name>.toepub/` |
 
 If you make a mistake, the full help is printed, followed by the error. Mistyped options get a suggestion (`did you mean --force-ocr?`).
 
@@ -105,7 +105,7 @@ On an Apple M4 Pro, a warm run converts a 15-page paper in about 7 s and a 264-p
 ## Development
 
 ```bash
-uv run --with pytest pytest -q     # unit tests for pdf2epub's own logic, no models needed
+uv run --with pytest pytest -q     # unit tests for toepub's own logic, no models needed
 ```
 
 ## Credits

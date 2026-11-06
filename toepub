@@ -6,7 +6,7 @@
 #   "ocrmac>=1.0; sys_platform == 'darwin'",
 # ]
 # ///
-"""pdf2epub - convert PDF and Markdown books and documents to EPUB.
+"""toepub - convert PDF and Markdown books and documents to EPUB.
 
 PDF: routed automatically, page by page
   pages with a real text layer      -> text is read directly (fast, exact)
@@ -36,11 +36,11 @@ Markdown (.md): straight to pandoc, no models, about a second
   Each .md file becomes its own book.
 
 Examples:
-  pdf2epub book.pdf
-  pdf2epub notes.md
-  pdf2epub *.pdf *.md -o ~/Books
-  pdf2epub scan.pdf --lang es --force-ocr
-  pdf2epub book.pdf --pages 1-20 --keep      # quick test, keep the markdown
+  toepub book.pdf
+  toepub notes.md
+  toepub *.pdf *.md -o ~/Books
+  toepub scan.pdf --lang es --force-ocr
+  toepub book.pdf --pages 1-20 --keep      # quick test, keep the markdown
 """
 
 from __future__ import annotations
@@ -85,7 +85,7 @@ class Parser(argparse.ArgumentParser):
                                                       n=1, cutoff=0.7)
                     if close:
                         hints.append(f"did you mean {close[0]} instead of {tok}?")
-        log(f"\npdf2epub: error: {message}")
+        log(f"\ntoepub: error: {message}")
         for h in hints:
             log(f"  {h}")
         sys.exit(2)
@@ -125,7 +125,7 @@ def lang_arg(value: str) -> list[str]:
 
 def parse_args() -> argparse.Namespace:
     p = Parser(
-        prog="pdf2epub",
+        prog="toepub",
         description=__doc__.split("\n\n", 1)[0],
         epilog=__doc__.split("\n\n", 1)[1],
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -155,7 +155,7 @@ def parse_args() -> argparse.Namespace:
                      help="page to use as the cover (default: first page)")
     pdf.add_argument("--no-cover", action="store_true", help="don't add a cover image")
     pdf.add_argument("--keep", action="store_true",
-                     help="keep the intermediate markdown + images in <name>.pdf2epub/")
+                     help="keep the intermediate markdown + images in <name>.toepub/")
     if len(sys.argv) == 1:
         p.print_help(sys.stderr)
         sys.exit(2)
@@ -185,7 +185,7 @@ def check_input(path: Path) -> tuple[str | None, str | None]:
     if not path.exists():
         return None, "no such file"
     if path.is_dir():
-        return None, "is a folder (to convert everything in it: pdf2epub folder/*.pdf folder/*.md)"
+        return None, "is a folder (to convert everything in it: toepub folder/*.pdf folder/*.md)"
     try:
         with path.open("rb") as f:
             head = f.read(1024)
@@ -456,7 +456,7 @@ MARKDOWN_FROM = "markdown+mark"
 
 def front_matter(src: Path) -> tuple[str | None, str | None]:
     """(title, author) from the YAML front matter, as pandoc reads them."""
-    with tempfile.TemporaryDirectory(prefix="pdf2epub-") as d:
+    with tempfile.TemporaryDirectory(prefix="toepub-") as d:
         tpl = Path(d) / "meta.plain"
         tpl.write_text("$title$\x1e$for(author)$$author$$sep$; $endfor$", encoding="utf-8")
         r = subprocess.run(["pandoc", str(src), "--from", MARKDOWN_FROM, "--to", "plain",
@@ -476,7 +476,7 @@ def convert_markdown(src: Path, out: Path, args: argparse.Namespace) -> bool:
 
     missing: list[str] = []
     text = obsidian_to_markdown(text, attachment_finder(src), missing)
-    with tempfile.TemporaryDirectory(prefix="pdf2epub-") as d:
+    with tempfile.TemporaryDirectory(prefix="toepub-") as d:
         md = Path(d) / "book.md"
         md.write_text(text, encoding="utf-8")
         front_title, front_author = front_matter(md)
@@ -627,17 +627,17 @@ def convert_pdf(converter, pdf: Path, out: Path, args: argparse.Namespace) -> bo
     from docling_core.types.doc import ImageRefMode
 
     rng = args.pages
-    keep_dir = out.with_name(out.stem + ".pdf2epub")
+    keep_dir = out.with_name(out.stem + ".toepub")
     tmp_ctx = None
     if args.keep:
         if keep_dir.exists():
             if not (keep_dir / "book.md").exists() and any(keep_dir.iterdir()):
-                raise ValueError(f"{keep_dir} exists and wasn't made by pdf2epub; not touching it")
+                raise ValueError(f"{keep_dir} exists and wasn't made by toepub; not touching it")
             shutil.rmtree(keep_dir)
         keep_dir.mkdir(parents=True)
         work = keep_dir
     else:
-        tmp_ctx = tempfile.TemporaryDirectory(prefix="pdf2epub-")
+        tmp_ctx = tempfile.TemporaryDirectory(prefix="toepub-")
         work = Path(tmp_ctx.name)
 
     try:
@@ -704,7 +704,7 @@ def convert_pdf(converter, pdf: Path, out: Path, args: argparse.Namespace) -> bo
 def main() -> int:
     args = parse_args()
     if not shutil.which("pandoc"):
-        log("pdf2epub: error: pandoc is not installed (macOS: brew install pandoc, "
+        log("toepub: error: pandoc is not installed (macOS: brew install pandoc, "
             "others: https://pandoc.org/installing.html)")
         return 1
 
@@ -716,7 +716,7 @@ def main() -> int:
         if out in claimed:
             problem = f"would write the same {out.name} as {claimed[out]}; convert it separately"
         if problem:
-            log(f"pdf2epub: error: {given}: {problem}")
+            log(f"toepub: error: {given}: {problem}")
             failed.append((given, problem))
             continue
         claimed[out] = given
@@ -726,7 +726,7 @@ def main() -> int:
         jobs.append((kind, src, out))
     if not jobs:
         if failed:
-            log("nothing to convert (pdf2epub -h for help)")
+            log("nothing to convert (toepub -h for help)")
             return 2
         log("nothing to convert")
         return 0
